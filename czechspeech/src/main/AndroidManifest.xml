@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  CzechSpeech declares no permissions at all, in particular no network permission: the only network code is the
+  optional CzechSpeechModel.download helper, and an app that uses it declares network access itself. Apps that
+  call listen() declare and request RECORD_AUDIO.
+-->
+<manifest />

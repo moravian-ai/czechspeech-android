@@ -1,0 +1,52 @@
+# Builds the native libraries from the pinned whisper.cpp, then runs the JVM tests, Android lint, the sample build and
+# the release script's own tests. The integration tests that need the 474 MB model skip (their environment variables
+# are not set). Nothing is published from CI.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: NDK r27c, CMake 3.22.1, platform 36
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;27.2.12479018" "cmake;3.22.1" "platforms;android-36" "build-tools;36.0.0"
+      - name: Native libraries (all CPU variants and the host library)
+        env:
+          JOBS: 4
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+          export CMAKE_BIN_DIR="$ANDROID_HOME/cmake/3.22.1/bin"
+          export CZECHSPEECH_NATIVE_BUILD_DIR="$RUNNER_TEMP/czechspeech-native"
+          native/build-native.sh all
+          sha256sum native/out/jniLibs/*/*.so native/out/host/*/*.so
+      - name: Unit tests (the public API listing included)
+        run: ./gradlew :czechspeech:testReleaseUnitTest
+      - name: Lint and the sample app
+        run: ./gradlew :czechspeech:lintRelease :sample:assembleDebug
+      - name: Unsigned publication into a folder (what the release script signs and uploads)
+        run: ./gradlew :czechspeech:publishToLocalFolder
+      - name: The release script's guards (throwaway key, stub curl, no network)
+        run: scripts/test-release-maven-central.sh
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-reports
+          path: czechspeech/build/reports
