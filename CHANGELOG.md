@@ -3,7 +3,7 @@
 All notable changes to CzechSpeech for Android. The format follows [Keep a Changelog](https://keepachangelog.com/).
 Until 1.0, a minor version may change the API.
 
-## [0.2.0] - 2026-11-16
+## [0.2.0] - 2026-11-17
 
 The first public release, on Maven Central as `ai.moravian:czechspeech-android:0.2.0`. No `0.1.0` was ever
 published: that number was only staged locally on 4 Nov 2026 (before `stop()`, the repetition-loop guard and the
