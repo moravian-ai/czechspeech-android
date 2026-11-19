@@ -20,10 +20,22 @@ object TestEnv {
     val model: File get() = fromEnv("CZECHSPEECH_MODEL")
     val audioDir: File get() = fromEnv("CZECHSPEECH_TEST_AUDIO")
     val manifest: File get() = fromEnv("CZECHSPEECH_TEST_MANIFEST")
+
+    /** Work directory of the measurement of streaming transcription (replay data of the simulation, recordings). */
+    val streamingWork: File get() = fromEnv("CZECHSPEECH_STREAMING_WORK")
+
     val threads: Int get() = System.getenv("CZECHSPEECH_TEST_THREADS")?.toIntOrNull()?.coerceIn(1, 8) ?: 6
+
+    /** The Czech GPT-2 language model of variant selection (scripts/lm/convert_gpt2.py), for its tests. */
+    val languageModel: File get() = fromEnv("CZECHSPEECH_LM")
 
     /** The Silero VAD asset bundled in the AAR. */
     val vadAsset: File get() = File("src/main/assets/czechspeech/ggml-silero-v6.2.0.bin")
+
+    /** Test data of the language model (scripts/lm/make_reference.py): a tiny GPT-2 and PyTorch's reference. */
+    val lmResources: File get() = File("src/test/resources/lm")
+    val tinyLm: File get() = File(lmResources, "tiny-gpt2-f32.gguf")
+    val tinyLmQ8: File get() = File(lmResources, "tiny-gpt2-q8_0.gguf")
 
     /** An unset variable gives a path that does not exist, so [assumeFile] skips and names the variable. */
     private fun fromEnv(name: String): File =
@@ -66,6 +78,50 @@ object TestEnv {
         val line = manifest.useLines { lines -> lines.firstOrNull { it.contains("\"id\": \"$id\"") || it.contains("\"id\":\"$id\"") } }
         Assume.assumeTrue("manifest entry $id", line != null)
         return Regex(""""ref":\s*"((?:[^"\\]|\\.)*)"""").find(line!!)!!.groupValues[1]
+    }
+}
+
+/**
+ * A sentence of reference-*.tsv (scripts/lm/make_reference.py): the sum of its token log-probabilities from PyTorch
+ * (float32), its token ids from the Hugging Face tokenizer (without the start token), and the text (invented).
+ */
+class LmReference(val logprob: Double, val ids: IntArray, val text: String) {
+    companion object {
+        fun read(file: File): List<LmReference> = file.readLines(Charsets.UTF_8).filter { it.isNotEmpty() }.map { line ->
+            val (logprob, ids, text) = line.split('\t', limit = 3)
+            LmReference(logprob.toDouble(), ids.split(' ').filter { it.isNotEmpty() }.map(String::toInt).toIntArray(), text)
+        }
+    }
+}
+
+/**
+ * Hypotheses in the layout of the native n-best call (czechspeech_jni.c, cs_put_hypotheses), for fakes and parser
+ * tests.
+ */
+object NBestBytes {
+    class Hyp(
+        val text: String,
+        val sumLogprob: Double,
+        val length: Int,
+        val best: Boolean = false,
+        val score: Double = 0.0,
+        val temperature: Float = 0f,
+    )
+
+    fun encode(windows: List<List<Hyp>>): ByteArray {
+        val texts = windows.map { w -> w.map { it.text.toByteArray(Charsets.UTF_8) } }
+        val size = 4 + windows.indices.sumOf { i -> 4 + texts[i].sumOf { 8 + 8 + 4 + 4 + 4 + 4 + it.size } }
+        val buf = ByteBuffer.allocate(size).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putInt(windows.size)
+        for ((i, w) in windows.withIndex()) {
+            buf.putInt(w.size)
+            for ((j, h) in w.withIndex()) {
+                buf.putDouble(h.sumLogprob).putDouble(h.score).putFloat(h.temperature)
+                buf.putInt(h.length).putInt(if (h.best) 1 else 0)
+                buf.putInt(texts[i][j].size).put(texts[i][j])
+            }
+        }
+        return buf.array()
     }
 }
 
@@ -174,6 +230,19 @@ object Signals {
     /** Sample [i] of an endless tone, for [ArrayAudioSource]'s tail. */
     fun toneAt(i: Long, hz: Double = 220.0, amplitude: Float = 0.3f) =
         (amplitude * sin(2 * PI * hz * i / SAMPLE_RATE)).toFloat()
+
+    /**
+     * "Speech" whose time can be read from every sample, for fakes that know what they recognise: at session ms
+     * `t = fromMs + i / 16`, sample `i` is `0.1f + (t * 1e-7).toFloat()` inside a word and `0.06f + (t * 1e-7).toFloat()`
+     * in the gap between words. Words are `[fromMs + 500k, fromMs + 500k + 400)` and gaps the remaining 100 ms of each
+     * 500 ms. Both levels are speech for [FakeNative] (above 0.05); the gaps are what [QuietPoint] finds, as pauses
+     * between words in real speech.
+     */
+    fun clock(fromMs: Long, seconds: Double): FloatArray = FloatArray((seconds * SAMPLE_RATE).toInt()) { i ->
+        val t = fromMs + i / 16.0
+        val inWord = i / 16 % 500 < 400
+        (if (inWord) 0.1f else 0.06f) + (t * 1e-7).toFloat()
+    }
 
     fun whiteNoise(seconds: Double, amplitude: Float = 0.1f, seed: Long = 1): FloatArray {
         val random = java.util.Random(seed)

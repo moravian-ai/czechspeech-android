@@ -11,12 +11,17 @@ captures/
 # Native build output (rebuild with native/build-native.sh)
 native/out/
 
+# Python (scripts/lm)
+__pycache__/
+
 # Never commit models or audio. The CzechSpeech model is downloaded at runtime
 # (CzechSpeechModel.download) or pushed with adb; test audio stays outside the repo.
 # The only bundled model is the Silero VAD asset, which is whitelisted below.
 *.bin
 !czechspeech/src/main/assets/czechspeech/ggml-silero-v6.2.0.bin
 *.gguf
+# The tiny random GPT-2 of the language-model tests (scripts/lm/make_reference.py tiny, 70 and 180 KB)
+!czechspeech/src/test/resources/lm/tiny-gpt2-*.gguf
 *.wav
 *.flac
 *.mp3

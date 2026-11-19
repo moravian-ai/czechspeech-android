@@ -4,6 +4,7 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -86,6 +87,54 @@ class UtteranceQueueTest {
         assertEquals("the consumer gets what was queued, then the closed queue ends", 1, taken.size)
         assertEquals(0, queue.queuedMs)
         assertEquals(1_500, queue.peakMs)
+    }
+
+    @Test
+    fun anEarlyUtteranceIsTakenOnlyByAnEmptyQueue() {
+        // behind a backlog an early start gains nothing
+        val queue = UtteranceQueue(maxSamples = 10_000L * SAMPLE_RATE / 1000)
+        queue.offer(utterance(1_000))
+        val early = utterance(500)
+        assertFalse(queue.offerEarly(early))
+        assertEquals("not taken: no room used", 1_000, queue.queuedMs)
+        queue.poll()
+        assertTrue(queue.offerEarly(early))
+        assertEquals(500, queue.queuedMs)
+    }
+
+    @Test
+    fun aRetractedEarlyUtteranceTakesNoRoomAndDoesNotKeepTheNextEarlyOneOut() = runBlocking {
+        val queue = UtteranceQueue(maxSamples = 2_000L * SAMPLE_RATE / 1000)
+        val early = utterance(1_500)
+        assertTrue(queue.offerEarly(early))
+        queue.forget(early)
+        assertEquals("it no longer counts as waiting audio", 0, queue.queuedMs)
+        // the next pause's recognition starts at once, behind nothing but the one that gave way to it
+        val next = utterance(1_800)
+        assertTrue("nothing real waits", queue.offerEarly(next))
+        assertFalse("now something does", queue.offerEarly(utterance(100)))
+        queue.forget(early)
+        assertEquals("forgetting twice changes nothing", 1_800, queue.queuedMs)
+        assertSame("the consumer still gets it, to drop it", early, queue.poll())
+        assertEquals(1_800, queue.queuedMs)
+        assertFalse(queue.offerEarly(utterance(100)))
+        assertSame(next, queue.poll())
+        assertEquals(0, queue.queuedMs)
+        assertTrue(queue.offerEarly(utterance(100)))
+        queue.close()
+        assertFalse("something still waits", queue.isFinished)
+        queue.forEach { }
+        assertTrue(queue.isFinished)
+    }
+
+    @Test
+    fun realSpeechIsNeverRefusedBecauseOfARetractedUtterance() {
+        val queue = UtteranceQueue(maxSamples = 2_000L * SAMPLE_RATE / 1000)
+        val early = utterance(1_500)
+        assertTrue(queue.offerEarly(early))
+        queue.forget(early)
+        assertEquals(UtteranceQueue.Offer.QUEUED, queue.offer(utterance(2_000)))
+        assertEquals(UtteranceQueue.Offer.FULL, queue.offer(utterance(100)))
     }
 
     @Test

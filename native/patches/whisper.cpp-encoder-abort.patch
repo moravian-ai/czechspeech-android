@@ -1,0 +1,82 @@
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index 4e9d8d5..676f66e 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -193,11 +193,31 @@ static bool ggml_graph_compute_helper(
+     return ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS;
+ }
+ 
++// czechspeech: the abort callback reaches the backends for the time of this graph, so that an abort stops the
++// computation between two nodes of the graph (ggml checks it after every node) instead of at its end.
++static void czechspeech_set_abort_callback(
++      ggml_backend_sched_t   sched,
++       ggml_abort_callback   abort_callback,
++                      void * abort_callback_data) {
++    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
++        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
++        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++
++        auto * fn_set_abort_callback = (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
++        if (fn_set_abort_callback) {
++            fn_set_abort_callback(backend, abort_callback, abort_callback_data);
++        }
++    }
++}
++
+ static bool ggml_graph_compute_helper(
+       ggml_backend_sched_t   sched,
+         struct ggml_cgraph * graph,
+                        int   n_threads,
+-                      bool   sched_reset = true) {
++                      bool   sched_reset = true,
++       ggml_abort_callback   abort_callback = nullptr,
++                      void * abort_callback_data = nullptr) {
+     for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+         ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+@@ -209,8 +229,17 @@ static bool ggml_graph_compute_helper(
+         }
+     }
+ 
++    if (abort_callback) {
++        czechspeech_set_abort_callback(sched, abort_callback, abort_callback_data);
++    }
++
+     const bool t = (ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+ 
++    if (abort_callback) {
++        // the callback's data lives only as long as the caller's whisper_full
++        czechspeech_set_abort_callback(sched, nullptr, nullptr);
++    }
++
+     if (!t || sched_reset) {
+         ggml_backend_sched_reset(sched);
+     }
+@@ -2464,7 +2493,7 @@ static bool whisper_encode_internal(
+         }
+ 
+         if (!whisper_encode_external(wstate)) {
+-            if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
++            if (!ggml_graph_compute_helper(sched, gf, n_threads, true, abort_callback, abort_callback_data)) {
+                 return false;
+             }
+         } else {
+@@ -2508,7 +2537,7 @@ static bool whisper_encode_internal(
+             return false;
+         }
+ 
+-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
++        if (!ggml_graph_compute_helper(sched, gf, n_threads, true, abort_callback, abort_callback_data)) {
+             return false;
+         }
+     }
+@@ -2524,7 +2553,7 @@ static bool whisper_encode_internal(
+             return false;
+         }
+ 
+-        if (!ggml_graph_compute_helper(sched, gf, n_threads)) {
++        if (!ggml_graph_compute_helper(sched, gf, n_threads, true, abort_callback, abort_callback_data)) {
+             return false;
+         }
+     }

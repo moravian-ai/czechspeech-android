@@ -1,0 +1,199 @@
+diff --git a/include/whisper.h b/include/whisper.h
+index 545084e..2cc9b9c 100644
+--- a/include/whisper.h
++++ b/include/whisper.h
+@@ -681,6 +681,24 @@ extern "C" {
+     WHISPER_API float whisper_full_get_token_p           (struct whisper_context * ctx, int i_segment, int i_token);
+     WHISPER_API float whisper_full_get_token_p_from_state(struct whisper_state * state, int i_segment, int i_token);
+ 
++    // [czechspeech] The hypotheses of every decoder for each window of the last whisper_full() call: the beams of a
++    // beam search (or the best_of samples of a temperature fallback), not only the one whisper.cpp chose. Only
++    // windows that produced output are listed (not a window dropped as no speech), and no failed decoder unless all
++    // failed (then the one whisper.cpp output).
++    typedef struct whisper_hypothesis {
++        const whisper_token * tokens;       // text tokens (id < EOT); valid until the next whisper_full or whisper_free
++        int                   n_tokens;
++        int                   result_len;   // the length whisper.cpp scored, EOT included
++        double                sum_logprobs; // sum of the log-probabilities of those result_len tokens
++        double                score;        // whisper.cpp's ranking: sum_logprobs over the length penalty
++        float                 temperature;  // of the decoding attempt (> 0: a fallback; log-probabilities of logits / T)
++        bool                  best;         // the hypothesis whisper.cpp chose for the window
++    } whisper_hypothesis;
++
++    WHISPER_API int whisper_full_n_hypothesis_windows(struct whisper_context * ctx);
++    WHISPER_API int whisper_full_n_hypotheses(struct whisper_context * ctx, int i_window);
++    WHISPER_API whisper_hypothesis whisper_full_get_hypothesis(struct whisper_context * ctx, int i_window, int i_hypothesis);
++
+     // Access the speech segments detected by the internal VAD (only when params.vad = true).
+     // Times are on the original audio timeline, in centiseconds. The count is 0 when VAD was
+     // not used, so callers can reuse whisper's own speech boundaries instead of running a
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index be0b865..4e9d8d5 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -893,6 +893,17 @@ struct whisper_state {
+ 
+     std::vector<whisper_segment> result_all;
+ 
++    // [czechspeech] the hypotheses of every decoder, per window that produced output (whisper_full_get_hypothesis)
++    struct hypothesis {
++        std::vector<whisper_token> tokens;
++        int    result_len;
++        double sum_logprobs;
++        double score;
++        float  temperature;
++        bool   best;
++    };
++    std::vector<std::vector<hypothesis>> hypotheses;
++
+     // prompt history split into static prefix (prompt_past0) and dynamic rolling context (prompt_past1)
+     std::vector<whisper_token>   prompt_past0; // static carried initial prompt (if enabled)
+     std::vector<whisper_token>   prompt_past1; // dynamic context from decoded output
+@@ -6690,10 +6701,14 @@ static whisper_token_data whisper_sample_token(
+     return result;
+ }
+ 
++// [czechspeech] sample: draw the k candidates from the distribution (the temperature fallback); otherwise take the k
++// most likely tokens. whisper.cpp 1.9.5 always drew them, which is no beam search: a confident model draws the same
++// token k times.
+ static std::vector<whisper_token_data> whisper_sample_token_topk(
+             whisper_context & ctx,
+             whisper_decoder & decoder,
+-                        int   k) {
++                        int   k,
++                       bool   sample) {
+     const auto & vocab = ctx.vocab;
+ 
+     const auto & probs    = decoder.probs;
+@@ -6748,10 +6763,13 @@ static std::vector<whisper_token_data> whisper_sample_token_topk(
+         ptsum = sum_ts;
+     }
+ 
+-    std::discrete_distribution<> dist(probs.begin(), probs.end());
++    std::discrete_distribution<> dist;
++    if (sample) {
++        dist = std::discrete_distribution<>(probs.begin(), probs.end());
++    }
+ 
+     for (int i = 0; i < k; ++i) {
+-        const auto id = dist(decoder.rng);
++        const auto id = sample ? dist(decoder.rng) : logits_id[i].second;
+         //printf("XXX %d %d %f %f %f %f\n", id, tid, probs[id], logprobs[id], pt, ptsum);
+ 
+         result.push_back({ id, tid, probs[id], logprobs[id], pt, ptsum, -1, -1, -1, 0.0f, });
+@@ -6991,6 +7009,7 @@ int whisper_full_with_state(
+     auto & result_all = state->result_all;
+ 
+     result_all.clear();
++    state->hypotheses.clear();
+ 
+     if (n_samples > 0) {
+         // compute log mel spectrogram
+@@ -7237,6 +7256,8 @@ int whisper_full_with_state(
+ 
+         int best_decoder_id = 0;
+ 
++        std::vector<whisper_state::hypothesis> hypotheses_cur; // [czechspeech] of the last attempt at this window
++
+         for (int it = 0; it < (int) temperatures.size(); ++it) {
+             const float t_cur = temperatures[it];
+ 
+@@ -7428,7 +7449,7 @@ int whisper_full_with_state(
+                                     } break;
+                                 case whisper_sampling_strategy::WHISPER_SAMPLING_BEAM_SEARCH:
+                                     {
+-                                        const auto tokens_new = whisper_sample_token_topk(*ctx, decoder, params.beam_search.beam_size);
++                                        const auto tokens_new = whisper_sample_token_topk(*ctx, decoder, params.beam_search.beam_size, t_cur > 0.0f);
+ 
+                                         for (const auto & token : tokens_new) {
+                                             bc_per_dec[j].push_back({ j, decoder.seek_delta, decoder.has_ts, decoder.sequence, decoder.grammar, });
+@@ -7495,7 +7516,9 @@ int whisper_full_with_state(
+ 
+                         auto & cur = beam_candidates[cur_c++];
+ 
+-                        while (beam_candidates.size() > cur_c && whisper_sequence_tokens_equal(beam_candidates[cur_c].sequence, cur.sequence) && i > 0) {
++                        // [czechspeech] skip duplicates in the first step too: whisper.cpp 1.9.5 did not (`&& i > 0`),
++                        // so every beam started with the same token and beam search could never change the first word
++                        while (beam_candidates.size() > cur_c && whisper_sequence_tokens_equal(beam_candidates[cur_c].sequence, cur.sequence)) {
+                             ++cur_c;
+                         }
+ 
+@@ -7749,6 +7772,46 @@ int whisper_full_with_state(
+                 WHISPER_LOG_DEBUG("%s: best decoder = %d\n", __func__, best_decoder_id);
+             }
+ 
++            // [czechspeech] keep every decoder's hypothesis of this attempt; the window keeps the last attempt's. When
++            // every decoder failed, whisper.cpp still outputs the chosen one, with all its tokens: so does the list.
++            hypotheses_cur.clear();
++            for (int j = 0; j < n_decoders_cur; ++j) {
++                const auto & decoder = state->decoders[j];
++
++                if (decoder.failed) {
++                    continue;
++                }
++
++                whisper_state::hypothesis h;
++                for (int k = 0; k < decoder.sequence.result_len; ++k) {
++                    if (decoder.sequence.tokens[k].id < whisper_token_eot(ctx)) {
++                        h.tokens.push_back(decoder.sequence.tokens[k].id);
++                    }
++                }
++                h.result_len   = decoder.sequence.result_len;
++                h.sum_logprobs = decoder.sequence.sum_logprobs;
++                h.score        = decoder.sequence.score;
++                h.temperature  = t_cur;
++                h.best         = j == best_decoder_id;
++                hypotheses_cur.push_back(std::move(h));
++            }
++            if (hypotheses_cur.empty()) {
++                const auto & decoder = state->decoders[best_decoder_id];
++
++                whisper_state::hypothesis h;
++                for (const auto & token : decoder.sequence.tokens) {
++                    if (token.id < whisper_token_eot(ctx)) {
++                        h.tokens.push_back(token.id);
++                    }
++                }
++                h.result_len   = decoder.sequence.result_len;
++                h.sum_logprobs = decoder.sequence.sum_logprobs;
++                h.score        = decoder.sequence.score;
++                h.temperature  = t_cur;
++                h.best         = true;
++                hypotheses_cur.push_back(std::move(h));
++            }
++
+             bool success = true;
+ 
+             // was the decoding successful for the current temperature?
+@@ -7791,6 +7854,10 @@ int whisper_full_with_state(
+             const bool is_no_speech = (state->no_speech_prob > params.no_speech_thold &&
+                 best_decoder.sequence.avg_logprobs < params.logprob_thold);
+ 
++            if (!is_no_speech && ctx->model.n_loaded > 0) { // [czechspeech] the window produced output
++                state->hypotheses.push_back(std::move(hypotheses_cur));
++            }
++
+             //WHISPER_LOG_DEBUG("prompt_init.size() = %d, prompt.size() = %d, result_len = %d, seek_delta = %d\n", prompt_init.size(), prompt.size(), result_len, seek_delta);
+ 
+             // update prompt_past1
+@@ -8373,6 +8440,20 @@ float whisper_full_get_segment_no_speech_prob_from_state(struct whisper_state *
+     return state->result_all[i_segment].no_speech_prob;
+ }
+ 
++// [czechspeech]
++int whisper_full_n_hypothesis_windows(struct whisper_context * ctx) {
++    return ctx->state->hypotheses.size();
++}
++
++int whisper_full_n_hypotheses(struct whisper_context * ctx, int i_window) {
++    return ctx->state->hypotheses[i_window].size();
++}
++
++whisper_hypothesis whisper_full_get_hypothesis(struct whisper_context * ctx, int i_window, int i_hypothesis) {
++    const auto & h = ctx->state->hypotheses[i_window][i_hypothesis];
++    return { h.tokens.data(), (int) h.tokens.size(), h.result_len, h.sum_logprobs, h.score, h.temperature, h.best };
++}
++
+ // =================================================================================================
+ 
+ //

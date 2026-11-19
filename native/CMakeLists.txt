@@ -3,6 +3,10 @@
 # One configure/build directory per CPU variant; native/build-native.sh drives it. The variant is chosen with the
 # ggml options passed on the command line (GGML_CPU_ARM_ARCH for arm64, GGML_SSE42 for the x86_64 emulator,
 # GGML_NATIVE for the host build used by JVM tests) and the output name with CZECHSPEECH_LIB_NAME.
+#
+# whisper.cpp is built with native/patches/*.patch applied (beam search fix, every beam's hypothesis): build-native.sh
+# extracts the pinned submodule into the build directory, patches it there and passes it as WHISPER_CPP_DIR. The
+# unpatched submodule does not link (the JNI code calls the patch's whisper_full_get_hypothesis).
 cmake_minimum_required(VERSION 3.22)
 project(czechspeech C CXX)
 
@@ -13,7 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CZECHSPEECH_LIB_NAME "czechspeech" CACHE STRING "Output name of the JNI library, without the lib prefix")
-set(WHISPER_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/whisper.cpp" CACHE PATH "whisper.cpp source tree")
+set(WHISPER_CPP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/whisper.cpp" CACHE PATH "whisper.cpp source tree, patched")
 
 if (NOT EXISTS "${WHISPER_CPP_DIR}/include/whisper.h")
     message(FATAL_ERROR "whisper.cpp not found in ${WHISPER_CPP_DIR}; run: git submodule update --init")
@@ -38,13 +42,13 @@ set(GGML_CUDA              OFF CACHE BOOL "" FORCE)
 
 add_subdirectory("${WHISPER_CPP_DIR}" whisper.cpp EXCLUDE_FROM_ALL)
 
-add_library(czechspeech SHARED src/czechspeech_jni.c)
+add_library(czechspeech SHARED src/czechspeech_jni.c src/czechspeech_lm.c)
 set_target_properties(czechspeech PROPERTIES
     OUTPUT_NAME "${CZECHSPEECH_LIB_NAME}"
     C_VISIBILITY_PRESET hidden
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON)
-target_link_libraries(czechspeech PRIVATE whisper)
+target_link_libraries(czechspeech PRIVATE whisper ggml)
 
 if (ANDROID)
     target_link_libraries(czechspeech PRIVATE log)

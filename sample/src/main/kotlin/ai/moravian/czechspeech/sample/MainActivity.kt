@@ -27,7 +27,8 @@ import java.io.File
  *
  * Model: a .bin pushed to getExternalFilesDir("models") wins, e.g.
  *   adb push ggml-czechspeech-q4_0.bin /sdcard/Android/data/ai.moravian.czechspeech.sample/files/models/
- * otherwise the "Download model" button fetches it with CzechSpeechModel.download.
+ * otherwise the "Download model" button fetches it with CzechSpeechModel.download. Debug builds add "Benchmark", the
+ * screen that times recognition per decoding mode (BenchmarkActivity, src/debug).
  */
 class MainActivity : ComponentActivity() {
     private var speech: CzechSpeech? = null
@@ -61,6 +62,7 @@ class MainActivity : ComponentActivity() {
             addView(status)
             addView(startStop)
             addView(download)
+            DebugScreens.addTo(this@MainActivity, this)
             addView(list, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         }
         // Edge to edge (Android 15+ for apps targeting API 35+): the action bar, the navigation bar and a cutout lie
@@ -137,6 +139,8 @@ class MainActivity : ComponentActivity() {
                             transcripts.insert("${t.text}\n%.1f s of speech, recognised in %d ms".format(seconds, t.processingMs), 0)
                             if (!finishing) status.text = "Listening…"
                         }
+                        is SpeechEvent.UtteranceDone -> Unit
+                        is SpeechEvent.UtteranceNotWritten -> status.text = "A stretch of speech could not be written"
                         is SpeechEvent.Error -> status.text = "Error: ${event.cause.message}"
                     }
                 }

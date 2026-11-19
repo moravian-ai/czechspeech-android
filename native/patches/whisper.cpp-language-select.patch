@@ -1,0 +1,120 @@
+diff --git a/include/whisper.h b/include/whisper.h
+index 545084e..a047998 100644
+--- a/include/whisper.h
++++ b/include/whisper.h
+@@ -588,6 +588,15 @@ extern "C" {
+         const char * vad_model_path;              // Path to VAD model
+ 
+         whisper_vad_params vad_params;
++
++        // [czechspeech] Only with language "auto": called once the language has been detected (on the window set by
++        // audio_ctx, with abort_callback and encoder_begin_callback honoured) with the probabilities of all
++        // languages (indexed by language id). Returns the language id to decode with; a value < 0 or above
++        // whisper_lang_max_id() aborts whisper_full() (it then returns -3). The audio is then encoded only once: the
++        // detection's encoder output is reused for the first window. NULL: whisper.cpp's own choice, the most
++        // probable language.
++        int  (*language_select_callback)(struct whisper_context * ctx, struct whisper_state * state, const float * lang_probs, void * user_data);
++        void * language_select_callback_user_data;
+     };
+ 
+     // NOTE: this function allocates memory, and it is the responsibility of the caller to free the pointer - see whisper_free_context_params & whisper_free_params()
+@@ -636,6 +645,9 @@ extern "C" {
+     // Language id associated with the provided state
+     WHISPER_API int whisper_full_lang_id_from_state(struct whisper_state * state);
+ 
++    // [czechspeech] Number of encoder runs of the context's default state since the last whisper_reset_timings()
++    WHISPER_API int whisper_full_n_encode(struct whisper_context * ctx);
++
+     // Get the start and end time of the specified segment
+     WHISPER_API int64_t whisper_full_get_segment_t0           (struct whisper_context * ctx, int i_segment);
+     WHISPER_API int64_t whisper_full_get_segment_t0_from_state(struct whisper_state * state, int i_segment);
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index be0b865..a558737 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -932,6 +932,11 @@ struct whisper_state {
+     // [EXPERIMENTAL] speed-up techniques
+     int32_t exp_n_audio_ctx = 0; // 0 - use default
+ 
++    // [czechspeech] the encoder output of the language selection stands for the window at seek cs_encoded_seek
++    // (-1: none) encoded with cs_encoded_ctx audio frames, so whisper_full() need not encode it again
++    int32_t cs_encoded_seek = -1;
++    int32_t cs_encoded_ctx  = 0;
++
+     whisper_vad_context * vad_context = nullptr;
+ 
+     struct vad_segment_info {
+@@ -6178,6 +6183,9 @@ struct whisper_full_params whisper_full_default_params(enum whisper_sampling_str
+         /*.vad_model_path              =*/ nullptr,
+ 
+         /* vad_params =*/ whisper_vad_default_params(),
++
++        /*.language_select_callback           =*/ nullptr,
++        /*.language_select_callback_user_data =*/ nullptr,
+     };
+ 
+     switch (strategy) {
+@@ -7000,6 +7008,18 @@ int whisper_full_with_state(
+         }
+     }
+ 
++    // [czechspeech] with a language selection the window is set before the detection, which encodes on it
++    state->cs_encoded_seek = -1;
++    const bool cs_select = params.language_select_callback != nullptr &&
++        (params.language == nullptr || strlen(params.language) == 0 || strcmp(params.language, "auto") == 0 || params.detect_language);
++    if (cs_select) {
++        if (params.audio_ctx > whisper_n_audio_ctx(ctx)) {
++            WHISPER_LOG_ERROR("%s: audio_ctx is larger than the maximum allowed (%d > %d)\n", __func__, params.audio_ctx, whisper_n_audio_ctx(ctx));
++            return -5;
++        }
++        state->exp_n_audio_ctx = params.audio_ctx;
++    }
++
+     // auto-detect language if not specified
+     if (params.language == nullptr || strlen(params.language) == 0 || strcmp(params.language, "auto") == 0 || params.detect_language) {
+         std::vector<float> probs(whisper_lang_max_id() + 1, 0.0f);
+@@ -7011,11 +7031,20 @@ int whisper_full_with_state(
+             }
+         }
+ 
+-        const auto lang_id = whisper_lang_auto_detect_internal(ctx, state, 0, params.n_threads, probs.data(), params.abort_callback, params.abort_callback_user_data);
++        auto lang_id = whisper_lang_auto_detect_internal(ctx, state, 0, params.n_threads, probs.data(), params.abort_callback, params.abort_callback_user_data);
+         if (lang_id < 0) {
+             WHISPER_LOG_ERROR("%s: failed to auto-detect language\n", __func__);
+             return -3;
+         }
++        if (cs_select) { // [czechspeech] the caller picks the language; the encoder output stays for the first window
++            lang_id = params.language_select_callback(ctx, state, probs.data(), params.language_select_callback_user_data);
++            if (lang_id < 0 || lang_id > whisper_lang_max_id()) {
++                WHISPER_LOG_ERROR("%s: language_select_callback returned %d - aborting\n", __func__, lang_id);
++                return -3;
++            }
++            state->cs_encoded_seek = 0;
++            state->cs_encoded_ctx  = state->exp_n_audio_ctx;
++        }
+         state->lang_id = lang_id;
+         params.language = whisper_lang_str(lang_id);
+ 
+@@ -7223,7 +7252,9 @@ int whisper_full_with_state(
+         }
+ 
+         // encode audio features starting at offset seek
+-        if (!whisper_encode_internal(*ctx, *state, seek, params.n_threads, params.abort_callback, params.abort_callback_user_data)) {
++        if (seek == state->cs_encoded_seek && state->exp_n_audio_ctx == state->cs_encoded_ctx) {
++            state->cs_encoded_seek = -1; // [czechspeech] the language selection has just encoded exactly this
++        } else if (!whisper_encode_internal(*ctx, *state, seek, params.n_threads, params.abort_callback, params.abort_callback_user_data)) {
+             WHISPER_LOG_ERROR("%s: failed to encode\n", __func__);
+             return -6;
+         }
+@@ -8132,6 +8163,11 @@ int whisper_full_lang_id(struct whisper_context * ctx) {
+     return ctx->state->lang_id;
+ }
+ 
++// [czechspeech]
++int whisper_full_n_encode(struct whisper_context * ctx) {
++    return ctx->state->n_encode;
++}
++
+ static int64_t map_processed_to_original_time(int64_t processed_time, const std::vector<vad_time_mapping> & mapping_table) {
+     if (mapping_table.empty()) {
+         return processed_time;

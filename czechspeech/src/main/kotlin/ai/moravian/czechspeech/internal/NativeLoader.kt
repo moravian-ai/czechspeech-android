@@ -133,7 +133,7 @@ internal class CpuFeatures(val flags: Set<String>) {
             for (line in cpuInfo.lineSequence()) {
                 val key = line.substringBefore(':').trim()
                 if (!key.equals("Features", ignoreCase = true)) continue
-                val flags = line.substringAfter(':').trim().split(Regex("\\s+")).filter { it.isNotEmpty() }.toSet()
+                val flags = line.substringAfter(':').trim().split(' ', '\t').filter { it.isNotEmpty() }.toSet()
                 common = common?.intersect(flags) ?: flags
             }
             return CpuFeatures(common.orEmpty())

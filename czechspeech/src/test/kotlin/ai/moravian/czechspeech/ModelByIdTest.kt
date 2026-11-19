@@ -100,6 +100,20 @@ class ModelByIdTest {
     }
 
     @Test
+    fun aCustomEntryWithALanguageSwitchPassesItsRuleToCzechSpeech() {
+        // The README snippet for a self-hosted model: an Entry outside the catalog, passed to the constructor with the file.
+        val source = CzechSpeechModel.Source("https://models.example.com/own.bin", 123_456L, "ab".repeat(32), "own.bin")
+        val rule = CzechSpeechModel.LanguageSwitch(mapOf("en" to 0.9f), minLeaveMs = 2_000, minReturnMs = 1_000)
+        val entry = CzechSpeechModel.Entry("own", source, listOf("cs", "sk", "en"), 25, rule)
+        assertFalse("not in the catalogue", CzechSpeechModel.CATALOG.containsKey("own"))
+        val speech = CzechSpeech(context(), File(tmp.root, "own.bin"), entry)
+        assertEquals(rule, speech.languageSwitch)
+        assertEquals(listOf("cs", "sk", "en"), speech.languages)
+        // The engine applies that rule (thresholds, return minimum) in LanguageSessionTest, on the same values.
+        assertEquals(null, CzechSpeech(context(), File(tmp.root, "own.bin"), CzechSpeechModel.entry("cs")).languageSwitch)
+    }
+
+    @Test
     fun duplicateLanguagesCountOnce() {
         val context = context()
         val file = File(tmp.root, "model.bin")

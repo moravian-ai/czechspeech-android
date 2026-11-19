@@ -15,11 +15,11 @@ import java.security.MessageDigest
 
 /**
  * Resumable, verified model download over [HttpURLConnection] (no other HTTP stack). The only network code in the
- * SDK. Downloads to `<name>.part`, resumes it with a Range request, checks size and SHA-256, then renames it.
+ * SDK. Downloads to `<name>.part` (decrypted on the way when the source is encrypted), resumes it with a Range request, checks size and SHA-256, then renames it.
  * A small `<name>.verified` marker (hash, size, mtime) lets later calls return without hashing 0.5 GB again.
  */
 internal object ModelDownloader {
-    const val USER_AGENT = "czechspeech-android/0.2.0"
+    const val USER_AGENT = "czechspeech-android/0.3.0"
     private const val MAX_REDIRECTS = 10
     private const val BUFFER_BYTES = 256 * 1024
     private const val PROGRESS_STEP_BYTES = 1L shl 20
@@ -116,6 +116,9 @@ internal object ModelDownloader {
                         else -> throw IOException("HTTP $code from ${conn.url.host}")
                     }
                     val buffer = ByteArray(BUFFER_BYTES)
+                    // The .part holds plaintext: decryption continues at its length (the keystream position is `have`).
+                    val cipher = source.encryption?.cipherAt(have)
+                    val plain = if (cipher != null) ByteArray(BUFFER_BYTES) else buffer
                     var reported = have
                     conn.inputStream.use { input ->
                         FileOutputStream(part, append).use { out ->
@@ -124,8 +127,9 @@ internal object ModelDownloader {
                                 val n = input.read(buffer)
                                 if (n < 0) break
                                 if (have + n > total) throw IOException("Server sent more than $total bytes")
-                                out.write(buffer, 0, n)
-                                digest.update(buffer, 0, n)
+                                if (cipher != null) decryptInto(cipher, buffer, n, plain)
+                                out.write(plain, 0, n)
+                                digest.update(plain, 0, n)
                                 have += n
                                 if (have - reported >= PROGRESS_STEP_BYTES) {
                                     reported = have
@@ -152,6 +156,16 @@ internal object ModelDownloader {
             CsLog.i("download: ${file.name} verified ($total bytes)")
             file
         }
+    }
+
+    /**
+     * Decrypts the first [n] bytes of [buffer] into [out] and checks that the cipher returned all of them: a JCA
+     * provider may hold back part of a block (BouncyCastle's buffered ciphers do), which would shift the whole stream
+     * and end in a misleading "SHA-256 mismatch".
+     */
+    fun decryptInto(cipher: javax.crypto.Cipher, buffer: ByteArray, n: Int, out: ByteArray) {
+        val m = cipher.update(buffer, 0, n, out, 0)
+        if (m != n) throw IOException("The AES/CTR provider ${cipher.provider.name} buffers its output ($m of $n bytes); it cannot decrypt a stream")
     }
 
     /** GET with an optional Range, following redirects by hand so the Range header survives them. */
@@ -222,7 +236,7 @@ internal object ModelDownloader {
 
     private fun checkContentRange(header: String?, from: Long, total: Long) {
         // "bytes 1000-473992234/473992235"
-        val match = Regex("""bytes\s+(\d+)-(\d+)/(\d+|\*)""").find(header.orEmpty())
+        val match = Regex(SdkPatterns.CONTENT_RANGE).find(header.orEmpty())
             ?: throw IOException("Missing or invalid Content-Range: $header")
         val start = match.groupValues[1].toLong()
         val size = match.groupValues[3].toLongOrNull()

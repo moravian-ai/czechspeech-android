@@ -3,7 +3,8 @@ package ai.moravian.czechspeech.internal
 import java.io.File
 
 /**
- * Number of recogniser threads: the big (high-frequency) cores of the device, at least 2 and at most 8.
+ * Number of recogniser threads: the big (high-frequency) cores of the device, at least 2 and at most 8. With thread
+ * placement on ([ThreadPlanner]) it is the limit of each recognition; off, the count of every recognition.
  *
  * Adapted from WhisperCpuConfig in whisper.cpp examples/whisper.android (MIT licence, The ggml authors): cores are
  * binned by their maximum frequency and the slowest bin is dropped; when frequencies cannot be read, the "CPU

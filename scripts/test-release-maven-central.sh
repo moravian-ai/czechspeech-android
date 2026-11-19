@@ -124,6 +124,14 @@ check "version without CHANGELOG heading refused" test $? -eq 1
 check "version with CHANGELOG heading accepted" test $? -eq 0
 (REPO_DIR="$R" check_version 1.2) >"$WORK/o" 2>"$WORK/e"
 check "version that is only a prefix of a heading refused" test $? -eq 1
+printf '# Changelog\n\n## [1.2.5] - YYYY-MM-DD\n' >"$R/CHANGELOG.md"
+(REPO_DIR="$R" check_version 1.2.5) >"$WORK/o" 2>"$WORK/e"
+check "heading with the placeholder date refused" test $? -eq 1
+check "placeholder date: message asks for the date" grep -q "no date" "$WORK/e"
+printf '# Changelog\n\n## [1.2.5]\n' >"$R/CHANGELOG.md"
+(REPO_DIR="$R" check_version 1.2.5) >"$WORK/o" 2>"$WORK/e"
+check "heading without any date refused" test $? -eq 1
+git -C "$R" checkout -q CHANGELOG.md
 
 echo "whole script refuses before building"
 rm -f "$WORK/gradlew-ran"
@@ -247,6 +255,42 @@ rm -f "$STUB_LOG".*
 (PATH="$STUB:$PATH" POLL_INTERVAL=0 STUB_FINAL=FAILED upload_and_wait "$WORK/out.zip" 1.2.3) >"$WORK/o" 2>"$WORK/e"
 check "FAILED deployment: exit 1" test $? -eq 1
 check "FAILED deployment: errors printed" grep -q "boom" "$WORK/o" "$WORK/e"
+
+echo "whole script as it runs for real (set -euo pipefail; stub gradle and curl, throwaway key)"
+R2="$WORK/repo2"
+mkdir -p "$R2/czechspeech"
+git -C "$R2" init -q
+git -C "$R2" config user.email t@example.invalid
+git -C "$R2" config user.name t
+printf 'version = "1.2.3"\n' >"$R2/czechspeech/build.gradle.kts"
+printf '# Changelog\n\n## [1.2.3] - 2026-11-07\n' >"$R2/CHANGELOG.md"
+# the stub of the Gradle run writes a signed demo bundle where the script asked for the Maven repository
+cat >"$R2/gradlew" <<EOS
+#!/usr/bin/env bash
+for a in "\$@"; do case "\$a" in -Pczechspeech.mavenRepoDir=*) repo="\${a#*=}" ;; esac; done
+d="\$repo/ai/moravian/czechspeech-android/1.2.3"
+mkdir -p "\$d"
+for f in czechspeech-android-1.2.3.aar czechspeech-android-1.2.3.pom; do
+    echo "content of \$f" >"\$d/\$f"
+    gpg --batch --yes --local-user "$KEY" --armor --detach-sign -o "\$d/\$f.asc" "\$d/\$f"
+    for g in "\$f" "\$f.asc"; do
+        md5sum "\$d/\$g" | cut -d" " -f1 >"\$d/\$g.md5"
+        sha1sum "\$d/\$g" | cut -d" " -f1 >"\$d/\$g.sha1"
+    done
+done
+EOS
+chmod +x "$R2/gradlew"
+git -C "$R2" add -A && git -C "$R2" commit -qm init
+rm -f "$STUB_LOG".*
+PATH="$STUB:$PATH" POLL_INTERVAL=0 GPG_KEY_NAME="$KEY" REPO_DIR="$R2" bash "$SCRIPT" >"$WORK/o" 2>"$WORK/e"
+check "script without --upload: exit 0" test $? -eq 0
+check "script without --upload: prints the bundle, uploads nothing" bash -c "grep -q '^bundle: ' '$WORK/o' && grep -q 'Not uploaded' '$WORK/o' && test ! -e '$STUB_LOG.argv'"
+rm -f "$STUB_LOG".*
+PATH="$STUB:$PATH" POLL_INTERVAL=0 GPG_KEY_NAME="$KEY" REPO_DIR="$R2" bash "$SCRIPT" --upload >"$WORK/o" 2>"$WORK/e"
+check "script with --upload to VALIDATED: exit 0 (the exit trap must not need a local variable)" test $? -eq 0
+check "script with --upload: nothing on stderr" test ! -s "$WORK/e"
+check "script with --upload: reports VALIDATED" grep -q "VALIDATED" "$WORK/o"
+check "script with --upload: token not on output" no_secret_in "$WORK/o" "$WORK/e"
 
 echo
 echo "$PASS passed, $FAIL failed"

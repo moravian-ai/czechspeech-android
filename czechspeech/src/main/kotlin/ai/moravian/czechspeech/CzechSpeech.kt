@@ -3,6 +3,7 @@ package ai.moravian.czechspeech
 import ai.moravian.czechspeech.internal.AndroidLog
 import ai.moravian.czechspeech.internal.AndroidMicSource
 import ai.moravian.czechspeech.internal.CpuThreads
+import ai.moravian.czechspeech.internal.CpuTopology
 import ai.moravian.czechspeech.internal.JniNativeApi
 import ai.moravian.czechspeech.internal.SpeechEngine
 import android.content.Context
@@ -37,8 +38,14 @@ import java.io.File
  *   false.
  * @param languages the languages of the model, two- or three-letter lowercase whisper language codes; the default is
  *   the default model's, `["cs"]` (see [CzechSpeechModel.DEFAULT_ID] and [CzechSpeechModel.Entry.languages]). A repeated code counts once. One language is
- *   forced; with several, [listen] and [transcribe] take a `language`, or the recogniser detects it among them. Must
+ *   forced; with several, [listen], [listenWithPreviews] and [transcribe] take a `language`, or the recogniser decides it among
+ *   them by the rule of [languageSwitch] (the first language preferred), inside the recognition itself. Must
  *   not be empty. For a model of the catalog use the constructor that takes the [CzechSpeechModel.Entry] instead.
+ * @param languageSwitch the rule for leaving the first language automatically (see [CzechSpeechModel.LanguageSwitch]),
+ *   or null; then several [languages] take the most probable of them for every recognition, with no state and no rescue.
+ *   With one, a `listen` collection keeps a language between utterances, a language that came out empty is rescued, and a
+ *   language without a threshold is chosen only when asked for. Needs at least two languages and names only
+ *   languages after the first, otherwise IllegalArgumentException at construction.
  */
 public class CzechSpeech @JvmOverloads public constructor(
     context: Context,
@@ -46,6 +53,7 @@ public class CzechSpeech @JvmOverloads public constructor(
     public val config: CzechSpeechConfig = CzechSpeechConfig(),
     public val keepModelLoaded: Boolean = false,
     languages: List<String> = CzechSpeechModel.entry(CzechSpeechModel.DEFAULT_ID).languages,
+    public val languageSwitch: CzechSpeechModel.LanguageSwitch? = null,
 ) : Closeable {
     /** A copy of the list passed in, without repeats; the engine rejects an empty list and bad codes at construction. */
     public val languages: List<String> = languages.distinct()
@@ -60,7 +68,9 @@ public class CzechSpeech @JvmOverloads public constructor(
         audioSourceFactory = { AndroidMicSource.create(appContext) },
         threads = { if (config.threads > 0) config.threads else CpuThreads.defaultThreadCount() },
         keepModelLoaded = keepModelLoaded,
+        cpuTopology = { CpuTopology.read() },
         languages = this.languages,
+        languageSwitch = languageSwitch,
     )
 
     /**
@@ -80,7 +90,7 @@ public class CzechSpeech @JvmOverloads public constructor(
         model: CzechSpeechModel.Entry,
         config: CzechSpeechConfig = CzechSpeechConfig(),
         keepModelLoaded: Boolean = false,
-    ) : this(context, modelFile, config, keepModelLoaded, model.languages)
+    ) : this(context, modelFile, config, keepModelLoaded, model.languages, model.languageSwitch)
 
     init {
         AndroidLog.install()
@@ -116,6 +126,42 @@ public class CzechSpeech @JvmOverloads public constructor(
      */
     @JvmOverloads
     public fun listen(language: String? = null): Flow<SpeechEvent> = engine.listen(language)
+
+    /**
+     * [listen] with previews: while an utterance is still being spoken, its text so far comes as [SpeechPreview]s,
+     * between the same [SpeechEvent]s as from [listen], in the same order. Without this call nothing of it runs.
+     *
+     * A preview is unstable text: show it as provisional (in grey, as composing text) and never insert it as finished
+     * text. The [SpeechEvent.Transcript] with the same `startMs` replaces it; a preview with empty text withdraws it
+     * when its utterance gives no transcript (see [SpeechPreview]).
+     *
+     * How previews run ([previews] sets the times):
+     * - The first preview of an utterance is recognised once it has lasted [PreviewConfig.firstAfterMs] (5 s), from
+     *   the audio captured so far, which stays in memory and is zeroed after use. The next ones come at the earliest
+     *   [PreviewConfig.intervalMs] (5 s) of audio after the previous one started, one at a time.
+     * - Final text first: no preview starts while an utterance waits for or is in its final recognition. A preview
+     *   that runs when its utterance ends is aborted (whisper.cpp stops within one step of its computation, also
+     *   inside the encoder) and its result is dropped, so it delays the final recognition by the time the abort
+     *   takes, which logcat reports. No preview starts in a pause (which may be the end), nor when, judged by the
+     *   speed of the last preview, it would still run when the utterance reaches [CzechSpeechConfig.maxUtteranceMs].
+     *   A preview never comes after the end of its speech nor after the Transcript of its utterance.
+     * - A preview decodes once, greedily, without whisper.cpp's temperature fallback and without the speech check,
+     *   both of which the final text keeps. Each one runs the recogniser over the whole utterance so far: with the
+     *   defaults a 28 s utterance gets up to 5 previews over about 75 s of audio, 2.7 times its own, on top of its
+     *   final recognition. On a slower phone previews come less often (one at a time), never at the expense of the
+     *   final text.
+     * - After [stop] no preview starts, and one that is running is aborted at once; cancelling the collection or
+     *   [close] aborts a preview that is running too.
+     *
+     * Everything else is as in [listen]: the same session, errors and rules, one collection at a time per instance.
+     *
+     * @param language as for [listen]: force this language, one of [languages]; null means the model's only language,
+     *   or the rule for several.
+     * @throws IllegalArgumentException (at once, from this call) for a [language] outside [languages].
+     */
+    @JvmOverloads
+    public fun listenWithPreviews(previews: PreviewConfig = PreviewConfig(), language: String? = null): Flow<ListenEvent> =
+        engine.listenWithPreviews(previews, language)
 
     /**
      * Finishes the active [listen] session. It finishes the word in progress: with speech in progress the microphone
@@ -170,8 +216,9 @@ public class CzechSpeech @JvmOverloads public constructor(
      * - the active [listen] collection is cancelled (the collector sees a CancellationException), and every
      *   [transcribe] call in progress resumes at once with that IllegalStateException;
      * - the microphone closes at the end of the frame being read (32 ms of audio);
-     * - native work already running (a model load, the speech check, an encoder pass) cannot be interrupted: it
-     *   finishes in the background, and the model is freed right after, also a model kept by [keepModelLoaded].
+     * - a recognition that is running is aborted and stops within one step of its computation; native work that
+     *   cannot be interrupted (a model load, the speech check, a run of the language model) finishes in the
+     *   background, and the model is freed right after, also a model kept by [keepModelLoaded].
      *   [awaitClosed] waits for that.
      *
      * Calling it again does nothing.
@@ -202,7 +249,7 @@ public class CzechSpeech @JvmOverloads public constructor(
 
     /**
      * Suspends until the work [close] could not stop at once has finished: the microphone is closed, native work
-     * that was running (a model load, the speech check, an encoder pass) has ended, and the model is freed. Use it,
+     * that was running (a model load, the speech check, a recognition being aborted) has ended, and the model is freed. Use it,
      * for example, before creating another instance, so that two models are never held at once. Returns at once
      * when nothing was running. Do not block the thread the [listen] collector runs on while waiting.
      *

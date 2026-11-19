@@ -10,6 +10,12 @@
 # The Kotlin loader (NativeLoader) picks one at runtime from /proc/cpuinfo, so no phone gets instructions it lacks.
 # Every Android library is checked for 16 KB LOAD alignment and for instructions above its variant's level.
 #
+# whisper.cpp is the pinned submodule with native/patches/*.patch applied (the beam search fix and every beam's
+# hypothesis, for variant selection; the abort callback inside the encoder; the language selection inside
+# whisper_full). The submodule itself is never modified: its commit is extracted with git archive
+# into $CZECHSPEECH_NATIVE_BUILD_DIR/whisper.cpp-patched and patched there, again only when the commit or a patch
+# changes. To update whisper.cpp, move the submodule and WHISPER_COMMIT, then refresh the patches until they apply.
+#
 # Usage (Linux or WSL):  native/build-native.sh [all|android|host]      (default: all)
 # Environment:
 #   ANDROID_NDK_HOME              NDK r27c        (default ~/android/android-ndk-r27c)
@@ -42,6 +48,35 @@ actual=$(git -C "$WHISPER" rev-parse HEAD 2>/dev/null || echo unknown)
 [ "$actual" = "$WHISPER_COMMIT" ] || die "third_party/whisper.cpp is at $actual, expected $WHISPER_COMMIT"
 [ -x "$CMAKE" ] && [ -x "$NINJA" ] || die "cmake/ninja not found in $CMAKE_BIN_DIR"
 
+PATCHED=$BUILD/whisper.cpp-patched
+
+# The patches took: the patched header declares their API. An unpatched tree is never stamped nor reused.
+patched_ok() {
+    local header=$PATCHED/include/whisper.h
+    grep -q 'whisper_full_get_hypothesis' "$header" 2>/dev/null && grep -q 'language_select_callback' "$header" 2>/dev/null
+}
+
+# The pinned whisper.cpp with native/patches/*.patch applied, in $PATCHED; redone only when the commit or a patch changes.
+prepare_whisper() {
+    local want stamp p
+    want="$WHISPER_COMMIT $(cat "$ROOT"/native/patches/*.patch | sha256sum | cut -d' ' -f1)"
+    stamp=$(cat "$PATCHED.stamp" 2>/dev/null || true)
+    if [ "$stamp" = "$want" ] && patched_ok; then
+        echo "== whisper.cpp ${WHISPER_COMMIT:0:7} + native/patches (unchanged)"
+        return
+    fi
+    echo "== whisper.cpp ${WHISPER_COMMIT:0:7} + native/patches"
+    rm -rf "$PATCHED" "$PATCHED.stamp"
+    mkdir -p "$PATCHED"
+    git -C "$WHISPER" archive --format=tar "$WHISPER_COMMIT" | tar -x -C "$PATCHED"
+    for p in "$ROOT"/native/patches/*.patch; do
+        (cd "$PATCHED" && git apply --whitespace=nowarn "$p") || die "patch $(basename "$p") does not apply"
+        echo "   applied $(basename "$p")"
+    done
+    patched_ok || die "native/patches applied, but $PATCHED/include/whisper.h lacks whisper_full_get_hypothesis or language_select_callback"
+    echo "$want" > "$PATCHED.stamp"
+}
+
 build_android() {  # name abi ggml-options...
     local name=$1 abi=$2
     shift 2
@@ -54,7 +89,7 @@ build_android() {  # name abi ggml-options...
         -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" \
-        -DCZECHSPEECH_LIB_NAME="$name" -DGGML_NATIVE=OFF "$@" > "$dir.configure.log" 2>&1 \
+        -DCZECHSPEECH_LIB_NAME="$name" -DWHISPER_CPP_DIR="$PATCHED" -DGGML_NATIVE=OFF "$@" > "$dir.configure.log" 2>&1 \
         || { tail -40 "$dir.configure.log"; die "configure $name failed"; }
     "$CMAKE" --build "$dir" --target czechspeech -j "$JOBS" > "$dir.build.log" 2>&1 \
         || { tail -60 "$dir.build.log"; die "build $name failed"; }
@@ -101,7 +136,7 @@ build_host() {
     "$CMAKE" -S "$ROOT/native" -B "$dir" -G Ninja -DCMAKE_MAKE_PROGRAM="$NINJA" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_FLAGS="$COMMON_FLAGS" -DCMAKE_CXX_FLAGS="$COMMON_FLAGS" \
-        -DCZECHSPEECH_LIB_NAME="$name" -DGGML_NATIVE=ON > "$dir.configure.log" 2>&1 \
+        -DCZECHSPEECH_LIB_NAME="$name" -DWHISPER_CPP_DIR="$PATCHED" -DGGML_NATIVE=ON > "$dir.configure.log" 2>&1 \
         || { tail -40 "$dir.configure.log"; die "configure $name failed"; }
     "$CMAKE" --build "$dir" --target czechspeech -j "$JOBS" > "$dir.build.log" 2>&1 \
         || { tail -60 "$dir.build.log"; die "build $name failed"; }
@@ -110,10 +145,14 @@ build_host() {
     echo "   $(ls -la "$OUT/host/linux-x86_64/lib$name.so" | awk '{print $5}') bytes"
 }
 
+# Stamp of the sources as they are NOW, before anything is prepared or compiled: sources edited during a long build
+# then differ from it, so libraries built from the old ones are never stamped as current.
+SOURCE_STAMP=$(bash "$ROOT/native/source-stamp.sh")
 mkdir -p "$BUILD"
+prepare_whisper
 case $WHAT in
     all|android)
-        rm -rf "$OUT/jniLibs"
+        rm -rf "$OUT/jniLibs" "$OUT/source-stamp"
         build_android czechspeech_armv8a                   arm64-v8a -DGGML_CPU_ARM_ARCH=armv8-a
         build_android czechspeech_armv82_dotprod_fp16      arm64-v8a -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
         build_android czechspeech_armv82_dotprod_fp16_i8mm arm64-v8a -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16+i8mm
@@ -123,6 +162,8 @@ case $WHAT in
         check_android "$OUT/jniLibs/arm64-v8a/libczechspeech_armv82_dotprod_fp16.so"      arm64-v8a dotprod
         check_android "$OUT/jniLibs/arm64-v8a/libczechspeech_armv82_dotprod_fp16_i8mm.so" arm64-v8a i8mm
         check_android "$OUT/jniLibs/x86_64/libczechspeech_x86_64.so"                      x86_64    base
+        # the stamp of the sources these libraries are made from; checkNativeLibs of czechspeech/build.gradle.kts compares it
+        echo "$SOURCE_STAMP" > "$OUT/source-stamp"
         ls -la "$OUT"/jniLibs/*/
         ;;
 esac

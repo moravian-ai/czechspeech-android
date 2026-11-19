@@ -1,4 +1,7 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.io.IOException
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 
 plugins {
     id("com.android.library")
@@ -8,7 +11,7 @@ plugins {
 }
 
 group = "ai.moravian"
-version = "0.2.0"
+version = "0.3.0"
 
 val nativeOut = rootProject.layout.projectDirectory.dir("native/out")
 val hostLibDir = nativeOut.dir("host/linux-x86_64")
@@ -113,12 +116,37 @@ val expectedNativeLibs = listOf(
 )
 
 val checkNativeLibs by tasks.registering {
-    description = "Fails when the prebuilt native libraries are missing (run native/build-native.sh android)."
+    description = "Fails when the prebuilt native libraries are missing or were built from other sources than the ones in " +
+        "this tree (run native/build-native.sh android). Only the tasks that package the AAR depend on it, not the unit tests."
     val dir = nativeOut.dir("jniLibs").asFile
+    val stampFile = nativeOut.file("source-stamp").asFile
     doLast {
         val missing = expectedNativeLibs.filterNot { dir.resolve(it).isFile }
         if (missing.isNotEmpty()) {
             throw GradleException("Missing native libraries in $dir: $missing. Run native/build-native.sh android first.")
+        }
+        // The libraries must be built from the native sources of this tree (a library without a newer native function throws
+        // UnsatisfiedLinkError on the first call): native/build-native.sh writes the hash of them next to the libraries.
+        // bash runs in the repository root with relative arguments with forward slashes: on Windows a bash does not open
+        // C:\... paths (WSL's) or the script needs the tools of its own environment (Git's), and the script resolves
+        // its paths from where it runs
+        val rel = rootProject.projectDir.toPath().relativize(stampFile.toPath()).toString().replace(File.separatorChar, '/')
+        val failure = "Cannot check the stamp of the native libraries. Run native/build-native.sh android (needs bash and sha256sum; on Windows use WSL or Git Bash)"
+        val check = try {
+            val process = ProcessBuilder("bash", "native/source-stamp.sh", "check", rel)
+                .directory(rootProject.projectDir).redirectErrorStream(true).start()
+            process.outputStream.close()
+            val reader = CompletableFuture.supplyAsync { process.inputStream.bufferedReader().readText().trim() }
+            if (!process.waitFor(60, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                throw GradleException("$failure: the stamp check did not finish in 60 s.")
+            }
+            process.exitValue() to reader.get(5, TimeUnit.SECONDS)
+        } catch (e: IOException) {
+            throw GradleException("$failure: bash could not be started (${e.message}).")
+        }
+        if (check.first != 0) {
+            throw GradleException(check.second.ifEmpty { "$failure: the script exited with ${check.first} and no output." })
         }
     }
 }

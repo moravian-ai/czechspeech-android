@@ -2,6 +2,7 @@ package ai.moravian.czechspeech.internal
 
 import ai.moravian.czechspeech.CzechSpeechConfig
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -34,7 +35,71 @@ class EndpointerTest {
         val ended get() = events.filterIsInstance<EndpointerEvent.SpeechEnded>()
 
         /** Frame indices contained in an utterance, from the sample values. */
-        fun frames(u: Utterance): List<Int> = (0 until u.samples.size / FRAME_SAMPLES).map { u.samples[it * FRAME_SAMPLES].toInt() }
+        fun frames(u: Utterance): List<Int> = frames(u.samples)
+
+        fun frames(samples: FloatArray): List<Int> =
+            (0 until samples.size / FRAME_SAMPLES).map { samples[it * FRAME_SAMPLES].toInt() }
+    }
+
+    @Test
+    fun thePieceInProgressIsKnownOnceSpeechIsConfirmedAndASnapshotCopiesItsAudioSoFar() {
+        val run = Run(config)
+        val e = run.endpointer
+        assertEquals(-1L, e.pieceMs)
+        assertEquals(0L, e.positionMs)
+        run.feed(0.02f, 50)             // frames 0..49
+        run.feed(0.9f, 7)               // 50..56: 224 ms of speech, not confirmed yet
+        assertEquals(-1L, e.pieceMs)
+        run.feed(0.9f, 1)               // frame 57: 256 ms, confirmed
+        assertEquals(50L * frameMs, e.pieceMs)
+        assertEquals(58L * frameMs, e.positionMs)
+        assertEquals("the cap counts from the pre-roll", (40L + 875) * frameMs, e.capMs)
+        val snapshot = e.snapshot()
+        assertEquals("pre-roll from frame 40, speech to the last frame", (40..57).toList(), run.frames(snapshot))
+        run.feed(0.9f, 10)
+        assertEquals("a copy", (40..57).toList(), run.frames(snapshot))
+        assertEquals((40..67).toList(), run.frames(e.snapshot()))
+        run.feed(0.02f, 19)             // the utterance ends
+        assertEquals(-1L, e.pieceMs)
+        assertEquals("the piece's start is its utterance's startMs", 50L * frameMs, run.utterances.single().startMs)
+        assertEquals(87L * frameMs, e.positionMs)
+
+        run.feed(0.9f, 20)
+        e.clear()
+        assertEquals(-1L, e.pieceMs)
+    }
+
+    @Test
+    fun speakingIsFalseInAPauseAndOutsideSpeech() {
+        val run = Run(config)
+        val e = run.endpointer
+        assertFalse(e.speaking)
+        run.feed(0.9f, 10)
+        assertTrue(e.speaking)
+        run.feed(0.15f, 1)              // at or above negThreshold: still speech
+        assertTrue(e.speaking)
+        run.feed(0.02f, 5)              // a pause within the utterance
+        assertFalse(e.speaking)
+        assertEquals("the utterance goes on", 0L, e.pieceMs)
+        run.feed(0.9f, 1)
+        assertTrue(e.speaking)
+        run.feed(0.02f, 19)             // the end
+        assertFalse(e.speaking)
+    }
+
+    @Test
+    fun aCutAtTheCapStartsANewPieceThatStartsWhereTheUtteranceEnded() {
+        val run = Run(config)
+        val e = run.endpointer
+        run.feed(0.9f, 843)
+        run.feed(0.3f, 1)               // frame 843: the quietest within the last 2 s
+        run.feed(0.9f, 40)              // the cap falls at frame 875
+        val first = run.utterances.single()
+        assertEquals(0L, first.startMs)
+        assertEquals(first.endMs, e.pieceMs)
+        assertEquals(844L * frameMs, e.pieceMs)
+        assertEquals((844..883).toList(), run.frames(e.snapshot()))
+        assertEquals((844L + 875) * frameMs, e.capMs)
     }
 
     @Test
@@ -161,6 +226,7 @@ class EndpointerTest {
                     is EndpointerEvent.SpeechStarted -> "S"
                     is EndpointerEvent.SpeechEnded -> "E"
                     is EndpointerEvent.UtteranceReady -> "U"
+                    else -> "early"         // only with CzechSpeechConfig.earlyStart
                 }
             },
         )

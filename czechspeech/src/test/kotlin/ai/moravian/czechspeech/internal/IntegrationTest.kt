@@ -111,6 +111,8 @@ class IntegrationTest {
                 is SpeechEvent.SpeechEnded -> "E${it.atMs}"
                 is SpeechEvent.Transcript -> "T${it.transcript.startMs}-${it.transcript.endMs}"
                 is SpeechEvent.Error -> "error"
+                is SpeechEvent.UtteranceDone -> "D${it.startMs}"
+                is SpeechEvent.UtteranceNotWritten -> "N${it.startMs}"
             }
         }
         val first = timeline(listen("determinism run 1", audio))
@@ -203,17 +205,17 @@ class IntegrationTest {
         val handle = api.whisperInit(TestEnv.model.path)
         try {
             api.whisperAbort(handle, 7)
-            val cancelled = api.whisperTranscribe(handle, 7, speech, speech.size, TestEnv.threads, "cs,en")
+            val cancelled = api.whisperTranscribe(handle, 7, speech, speech.size, TestEnv.threads, "cs,en", null)
             assertEquals("cancelled", null, cancelled)
             assertTrue("no language", api.whisperLanguage(handle).isNullOrEmpty())
 
-            val next = api.whisperTranscribe(handle, 8, speech, speech.size, TestEnv.threads, "cs,en")
+            val next = api.whisperTranscribe(handle, 8, speech, speech.size, TestEnv.threads, "cs,en", null)
             assertTrue("decodes normally", next != null && next.isNotEmpty())
             assertEquals("cs", api.whisperLanguage(handle))
             assertTrue(wordRecall(TestEnv.reference(SPEECH_ID), String(next!!, Charsets.UTF_8)) >= 0.8)
 
             // a forced language has no detection: it is reported as given
-            api.whisperTranscribe(handle, 9, speech, speech.size, TestEnv.threads, "cs")
+            api.whisperTranscribe(handle, 9, speech, speech.size, TestEnv.threads, "cs", null)
             assertEquals("cs", api.whisperLanguage(handle))
         } finally {
             api.whisperFree(handle)
@@ -227,7 +229,7 @@ class IntegrationTest {
         try {
             val audio = FloatArray(16_000)
             for (bad in listOf("", ",", "cs,", ",cs", "cs,,en", "xx", "cs,xx", "csxxxxxxxx", " cs")) {
-                val e = runCatching { api.whisperTranscribe(handle, 1, audio, audio.size, 1, bad) }.exceptionOrNull()
+                val e = runCatching { api.whisperTranscribe(handle, 1, audio, audio.size, 1, bad, null) }.exceptionOrNull()
                 assertTrue("\"$bad\" rejected: $e", e is IllegalArgumentException)
             }
             assertTrue(api.whisperLanguage(handle).isNullOrEmpty())

@@ -16,7 +16,7 @@ android {
         // Android 16, as Google Play requires; the screen keeps clear of the system bars itself (edge to edge).
         targetSdk = 36
         versionCode = 1
-        versionName = "0.2.0"
+        versionName = "0.3.0"
     }
 
     buildTypes {

@@ -47,8 +47,9 @@ class SpeechEngineTest {
         native: FakeNative,
         hooks: SpeechEngine.Hooks = SpeechEngine.Hooks.NONE,
         maxQueuedAudioMs: Long = MAX_QUEUED_AUDIO_MS,
+        config: CzechSpeechConfig = CzechSpeechConfig(),
         source: () -> AudioSource,
-    ) = fakeEngine(native, hooks, maxQueuedAudioMs, source = source)
+    ) = fakeEngine(native, hooks, maxQueuedAudioMs, config = config, source = source)
 
     /** Records the utterances the engine drops without recognition. */
     private class Discarded : SpeechEngine.Hooks {
@@ -200,6 +201,26 @@ class SpeechEngineTest {
     }
 
     @Test
+    fun aSwitchThatDoesNotFitTheLanguagesIsRefusedAtConstruction() {
+        fun switchOf(code: String) = ai.moravian.czechspeech.CzechSpeechModel.LanguageSwitch(mapOf(code to 0.9f))
+        failure<IllegalArgumentException> { fakeEngine(FakeNative(), languages = listOf("cs"), languageSwitch = switchOf("en")) { error("unused") } }
+        failure<IllegalArgumentException> { fakeEngine(FakeNative(), languages = listOf("cs", "sk", "en"), languageSwitch = switchOf("de")) { error("unused") } }
+        failure<IllegalArgumentException> { fakeEngine(FakeNative(), languages = listOf("cs", "sk", "en"), languageSwitch = switchOf("cs")) { error("unused") } }
+        fakeEngine(FakeNative(), languages = listOf("cs", "sk", "en"), languageSwitch = switchOf("en")) { error("unused") }
+        Unit
+    }
+
+    @Test
+    fun listenWithPreviewsRefusesALanguageOutsideTheListAtTheCall() {
+        val native = FakeNative()
+        val engine = fakeEngine(native, languages = listOf("pl", "en")) { ArrayAudioSource(utterance) }
+        failure<IllegalArgumentException> { engine.listenWithPreviews(ai.moravian.czechspeech.PreviewConfig(), "de") }
+        engine.listenWithPreviews(ai.moravian.czechspeech.PreviewConfig(), "en")
+        assertEquals(0, native.whisperInits.get())
+        assertFalse(engine.isListening)
+    }
+
+    @Test
     fun anEmptyLanguageListIsRejected() {
         failure<IllegalArgumentException> { fakeEngine(FakeNative(), languages = emptyList()) { error("unused") } }
         Unit
@@ -286,11 +307,12 @@ class SpeechEngineTest {
     @Test
     fun resultsWithoutLettersOrDigitsAreDropped() = runBlocking {
         val native = FakeNative().apply { text = " ... , ..." }
-        val engine = engine(native) { ArrayAudioSource(utterance) }
+        val engine = engine(native, config = CzechSpeechConfig(retryEmptyFinals = false)) { ArrayAudioSource(utterance) }     // a retry is in EmptyFinalRetrySessionTest
         assertEquals("", engine.transcribe(Signals.tone(1.0)))
         val events = engine.listen().toList()
         assertTrue(events.none { it is SpeechEvent.Transcript })
-        assertEquals(2, events.size)                // started + ended only
+        assertEquals("started + ended only, and the event of clear speech that was not written", 2, events.count { it !is SpeechEvent.UtteranceNotWritten })
+        assertEquals(1, events.count { it is SpeechEvent.UtteranceNotWritten })
         native.text = "91"
         assertEquals("91", engine.transcribe(Signals.tone(1.0)))
     }
@@ -298,15 +320,16 @@ class SpeechEngineTest {
     @Test
     fun anEmptyResultIsDroppedSilentlyAndTheUtteranceIsNotDecodedAgain() = runBlocking {
         // A model that learned to answer "no speech" with an empty transcript (suppress_blank is off): no Transcript
-        // event, no error, and one pass of the recogniser per utterance (the SDK never retries on its own).
+        // event, no error, and one pass of the recogniser per utterance (with the retry of empty finals off: by default an
+        // empty final of clear speech is repeated on a longer window, EmptyFinalRetrySessionTest).
         for (empty in listOf("", " ", "\n")) {
             val native = FakeNative().apply { text = empty }
-            val engine = engine(native) { ArrayAudioSource(utterance) }
+            val engine = engine(native, config = CzechSpeechConfig(retryEmptyFinals = false)) { ArrayAudioSource(utterance) }
             assertEquals("transcribe()", "", engine.transcribe(Signals.tone(1.0)))
             assertEquals(1, native.passedToWhisper.size)
             val events = engine.listen().toList()
             assertTrue("no Transcript or Error for '$empty': $events", events.none { it is SpeechEvent.Transcript || it is SpeechEvent.Error })
-            assertEquals(2, events.size)                // started + ended only
+            assertEquals(2, events.count { it !is SpeechEvent.UtteranceNotWritten })        // started + ended (+ the event of unwritten speech)
             assertEquals("one pass per utterance", 2, native.passedToWhisper.size)
         }
     }

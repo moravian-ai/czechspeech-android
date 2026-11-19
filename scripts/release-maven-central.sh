@@ -9,7 +9,7 @@
 #   scripts/release-maven-central.sh --upload    the same, then upload the bundle and wait for validation
 #
 # Environment:
-#   GPG_KEY_NAME   the signing key (default: Moravian AI's key, long ID E40DE78E91BEDC18)
+#   GPG_KEY_NAME   the signing key (default: the Moravian AI release key, fingerprint AA0D43AF9F55ADFD05CEA90005B99DEEB64F8A4C)
 #   SETTINGS_XML   Maven settings holding the Central Portal user token as <server><id>central</id> with
 #                  <username> and <password> (default: ~/.m2/settings.xml, or on WSL the Windows one)
 #   POLL_INTERVAL  seconds between status requests after an upload (default 10)
@@ -20,7 +20,7 @@
 # that is deleted on exit. The script never runs with `set -x` and never logs response headers.
 set -euo pipefail
 
-DEFAULT_KEY="E40DE78E91BEDC18"
+DEFAULT_KEY="AA0D43AF9F55ADFD05CEA90005B99DEEB64F8A4C"
 CENTRAL_URL="https://central.sonatype.com"
 PORTAL_URL="$CENTRAL_URL/publishing/deployments"
 
@@ -51,6 +51,9 @@ check_version() { # version
     local escaped="${version//./\\.}"
     grep -Eq "^##[[:space:]]+\[?${escaped}\]?([[:space:]]|\$)" "$REPO_DIR/CHANGELOG.md" ||
         die "CHANGELOG.md has no heading for version $version (expected \"## [$version] - <date>\")"
+    # the heading of an unreleased version carries the placeholder YYYY-MM-DD until the day of the release (RELEASING.md): never upload with it
+    grep -Eq "^##[[:space:]]+\[?${escaped}\]?[[:space:]]*-[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}" "$REPO_DIR/CHANGELOG.md" ||
+        die "the CHANGELOG.md heading of $version has no date (fill in the day of the release: \"## [$version] - 2026-MM-DD\")"
 }
 
 # Reads the user token of <server><id>central</id> from settings.xml into CENTRAL_USER and CENTRAL_PASS.
@@ -176,6 +179,7 @@ PY
 
 # curl with the Authorization header read from a private config file, never from the command line.
 CURL_CFG=""
+CENTRAL_BODY=""
 curl_central() { # curl arguments
     curl -sS -K "$CURL_CFG" "$@"
 }
@@ -193,52 +197,53 @@ PY
 }
 
 upload_and_wait() { # zip, version
-    local zip="$1" version="$2" code body id state tries=0
+    local zip="$1" version="$2" code id state tries=0
     [[ -n "${CENTRAL_USER:-}" && -n "${CENTRAL_PASS:-}" ]] || die "no Central credentials loaded"
     CURL_CFG="$(mktemp "${TMPDIR:-/tmp}/curl-cfg.XXXXXX")"
-    body="$(mktemp "${TMPDIR:-/tmp}/central-body.XXXXXX")"
-    chmod 600 "$CURL_CFG" "$body"
-    trap 'rm -f "$CURL_CFG" "$body"' EXIT
+    CENTRAL_BODY="$(mktemp "${TMPDIR:-/tmp}/central-body.XXXXXX")"
+    chmod 600 "$CURL_CFG" "$CENTRAL_BODY"
+    # a global (not a local) is read by the EXIT trap, which runs after this function has returned: set -u would trip on a local
+    trap 'rm -f "${CURL_CFG:-}" "${CENTRAL_BODY:-}"' EXIT
     trap 'exit 130' INT TERM
     printf 'header = "Authorization: Bearer %s"\n' "$(printf '%s:%s' "$CENTRAL_USER" "$CENTRAL_PASS" | base64 | tr -d '\n')" >"$CURL_CFG"
 
     echo "uploading $(basename "$zip") as czechspeech-android-$version (USER_MANAGED, no automatic publish)"
-    code="$(curl_central -o "$body" -w '%{http_code}' -X POST \
+    code="$(curl_central -o "$CENTRAL_BODY" -w '%{http_code}' -X POST \
         --form "bundle=@$zip" \
         "$CENTRAL_URL/api/v1/publisher/upload?publishingType=USER_MANAGED&name=czechspeech-android-$version")" ||
         die "the upload request failed"
     case "$code" in
         200 | 201) ;;
-        *) die "the upload was refused (HTTP $code); response: $(head -c 500 "$body" | tr -d '\r')" ;;
+        *) die "the upload was refused (HTTP $code); response: $(head -c 500 "$CENTRAL_BODY" | tr -d '\r')" ;;
     esac
-    id="$(tr -d '\r\n"' <"$body")"
+    id="$(tr -d '\r\n"' <"$CENTRAL_BODY")"
     [[ -n "$id" ]] || die "Central returned no deployment id"
     echo "deployment id: $id"
 
     while true; do
-        code="$(curl_central -o "$body" -w '%{http_code}' -X POST \
+        code="$(curl_central -o "$CENTRAL_BODY" -w '%{http_code}' -X POST \
             "$CENTRAL_URL/api/v1/publisher/status?id=$id")" || die "the status request failed"
         [[ "$code" == 200 ]] || die "the status request was refused (HTTP $code)"
-        state="$(json_field "$body" deploymentState)"
+        state="$(json_field "$CENTRAL_BODY" deploymentState)"
         echo "state: $state"
         case "$state" in
             VALIDATED)
-                rm -f "$CURL_CFG" "$body"
+                rm -f "$CURL_CFG" "$CENTRAL_BODY"
                 echo "Validated. Review it and press Publish at: $PORTAL_URL"
                 echo "(deployment id $id; a published version cannot be deleted or replaced)"
                 return 0
                 ;;
             FAILED)
                 echo "Deployment FAILED. Errors:" >&2
-                json_field "$body" errors >&2
-                rm -f "$CURL_CFG" "$body"
+                json_field "$CENTRAL_BODY" errors >&2
+                rm -f "$CURL_CFG" "$CENTRAL_BODY"
                 echo "Portal: $PORTAL_URL" >&2
                 return 1
                 ;;
         esac
         tries=$((tries + 1))
         if [[ "$tries" -ge "${POLL_MAX:-180}" ]]; then
-            rm -f "$CURL_CFG" "$body"
+            rm -f "$CURL_CFG" "$CENTRAL_BODY"
             die "still \"$state\" after $tries status requests; look at $PORTAL_URL (deployment id $id)"
         fi
         sleep "${POLL_INTERVAL:-10}"

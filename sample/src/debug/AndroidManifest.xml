@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug builds only: the Benchmark screen (BenchmarkActivity), started from MainActivity or with adb. It handles
+     rotation itself, so a run in progress is never restarted. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name=".BenchmarkActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+            android:exported="true" />
+    </application>
+</manifest>
